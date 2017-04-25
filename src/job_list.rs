@@ -1,20 +1,15 @@
 
 use job::*;
 use libc;
-use std::prelude::*;
-use std::borrow;
-use std::rc::*;
-use std::cell::*;
+use std::sync::*;
 
 pub struct JobList {
-    forground_job: Option<Rc<RefCell<Job>>>,
-    list: Vec<Rc<RefCell<Job>>>,
+    pub forground_job: Option<Arc<Mutex<Job>>>,
+    pub list: Vec<Arc<Mutex<Job>>>,
 }
 
-fn rc_ptr_eq(this: &Rc<RefCell<Job>>, other: &Rc<RefCell<Job>>) -> bool {
-    unsafe {
-        (**this).as_ptr() as *const Job == (**other).as_ptr() as *const Job
-    }
+fn rc_ptr_eq(this: &Arc<Mutex<Job>>, other: &Arc<Mutex<Job>>) -> bool {
+    Arc::ptr_eq(this, other)
 }
 
 impl JobList {
@@ -28,33 +23,34 @@ impl JobList {
     pub fn make_job_forground(&mut self) {
         match self.forground_job {
             Some(ref job_ref) => {
-                let mut job = job_ref.borrow_mut();
+                let mut job = job_ref.lock().unwrap();
 
-                unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, job.pgrp); }
+                unsafe { libc::tcsetpgrp(libc::STDIN_FILENO, (*job).pgrp); }
                 job.cont();
             },
-            _ => {
+            None => {
 
             }
         }
     }
 
-    pub fn add_job(&mut self, mut job: Job) -> Rc<RefCell<Job>> {
-        self.list.push(Rc::new(RefCell::new((job))));
+    pub fn add_job(&mut self, job: Job) -> Arc<Mutex<Job>> {
+        self.list.push(Arc::new(Mutex::new((job))));
         {
-            let mut new_job = self.list.last_mut().unwrap();
+            let new_job = self.list.last_mut().unwrap();
+            let mut job_locked = new_job.lock().unwrap();
+            job_locked.start();
 
-            {
-                let mut borrow = new_job.borrow_mut();
-                borrow.start();
-            }
-
-            if !new_job.borrow().is_background {
+            if !job_locked.is_background {
                 self.forground_job = Some(new_job.clone());
             }
         }
 
         self.list.last_mut().unwrap().clone()
+    }
+
+    pub fn set_forground_job(&mut self, job: Option<Arc<Mutex<Job>>>) {
+        self.forground_job = job;
     }
 
     pub fn remove_job(&mut self, job_index: usize) {
@@ -65,9 +61,9 @@ impl JobList {
         self.list.is_empty()
     }
 
-    pub fn find_pgrp(&mut self, pgrp: libc::pid_t) -> (Option<Rc<RefCell<Job>>>, usize) {
+    pub fn find_pgrp(&mut self, pgrp: libc::pid_t) -> (Option<Arc<Mutex<Job>>>, usize) {
         for i in 0..self.list.len() {
-            if self.list[i].borrow().pgrp == pgrp {
+            if self.list[i].lock().unwrap().pgrp == pgrp {
                 return (Some(self.list[i].clone()), i);
             }
         }
@@ -75,11 +71,10 @@ impl JobList {
         (None, 0)
     }
 
-    pub fn find_pid(&mut self, pid: libc::pid_t, prog_index: &mut usize) -> (Option<Rc<RefCell<Job>>>, usize) {
+    pub fn find_pid(&mut self, pid: libc::pid_t, prog_index: &mut usize) -> (Option<Arc<Mutex<Job>>>, usize) {
         for i in 0..self.list.len() {
-            let mut j = self.list[i].borrow_mut();
+            let j = self.list[i].lock().unwrap();
 
-            println!("Checking job: {:?}", j);
             for k in 0..j.progs.len() {
                 if j.progs[k].pid == pid {
                     *prog_index = k;
@@ -91,8 +86,8 @@ impl JobList {
         (None, 0)
     }
 
-    fn update_job_list(&mut self) {
-        let mut waitpid_flags: libc::c_int = 0;
+    pub fn update_job_list(&mut self) {
+        let mut waitpid_flags: libc::c_int = libc::WUNTRACED;
         self.make_job_forground();
 
         if self.forground_job.is_none() {
@@ -100,7 +95,7 @@ impl JobList {
         }
 
         loop {
-            let mut pid: libc::pid_t;
+            let pid: libc::pid_t;
             let mut wstatus: libc::c_int = 0;
 
             unsafe { pid = libc::waitpid(-1, &mut wstatus as *mut libc::c_int, waitpid_flags); }
@@ -109,16 +104,12 @@ impl JobList {
                 break;
             }
 
-            println!("Waitpid returned: {}", pid);
-
             let mut prog_index: usize = 0;
-            let (mut job, index) = self.find_pid(pid, &mut prog_index);
-
-            println!("Found pid: {} -> {}", index, prog_index);
+            let (job, index) = self.find_pid(pid, &mut prog_index);
 
             match job {
                 Some(ref j) => {
-                    let mut job = j.borrow_mut();
+                    let mut job = j.lock().unwrap();
 
                     unsafe {
                         let w_exited = libc::WIFEXITED(wstatus);
@@ -126,22 +117,19 @@ impl JobList {
                         let w_stopped = libc::WIFSTOPPED(wstatus);
                         let w_continued = libc::WIFCONTINUED(wstatus);
 
-                        println!("Exited: {}, Signaled: {}, Stopped: {}, Continued: {}", w_exited, w_signaled, w_stopped, w_continued);
-
                         if w_exited || w_signaled {
                             job.progs[prog_index].pid = -1;
 
                             if job.has_exited() {
                                 self.list.remove(index);
                                 if self.forground_job.is_some() && rc_ptr_eq(&j, &self.forground_job.as_mut().unwrap()) {
-                                    println!("Setting shell to process group leader\n");
                                     libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpid());
                                     return ;
                                 } else {
                                     if w_exited {
-                                        println!("[{}] Finished: {}", index, libc::WEXITSTATUS(wstatus));
+                                        println!("[{}] Finished: {}", index + 1, libc::WEXITSTATUS(wstatus));
                                     } else {
-                                        println!("[{}] Killed by signal {}", index, libc::WTERMSIG(wstatus));
+                                        println!("[{}] Killed by signal {}", index + 1, libc::WTERMSIG(wstatus));
                                     }
                                 }
                             }
@@ -156,9 +144,10 @@ impl JobList {
                                 libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpid());
                             }
 
-                            println!("[{}] Stopped", index);
+                            println!("[{}] Stopped", index + 1);
 
                             if rc_ptr_eq(&j, &self.forground_job.as_mut().unwrap()) {
+                                self.forground_job = None;
                                 return ;
                             }
 
@@ -174,16 +163,6 @@ impl JobList {
             }
         }
 
-    }
-
-    pub fn make_forground(&mut self, job: &mut Rc<RefCell<Job>>) {
-        self.forground_job = Some(job.clone());
-        self.update_job_list();
-    }
-
-    pub fn update_background(&mut self) {
-        self.forground_job = None;
-        self.update_job_list();
     }
 }
 

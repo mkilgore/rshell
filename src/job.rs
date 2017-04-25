@@ -3,6 +3,7 @@ use prog::*;
 use libc;
 use lexer::*;
 use std::ffi::CString;
+use builtin::*;
 
 #[derive(PartialEq, Debug)]
 pub enum JobState {
@@ -33,20 +34,14 @@ impl Job {
     pub fn start(&mut self) {
         let mut pgrp: libc::c_int = 0;
 
-        println!("In start");
-
         for prog in &mut self.progs {
             prog.pgrp = pgrp;
-            println!("Running process");
-
             prog.run();
 
-            println!("Ran process: {}", prog.pid);
 
             if pgrp == 0 {
                 pgrp = prog.pid;
                 prog.pgrp = prog.pid;
-                println!("New Process Group: {}", pgrp);
             }
         }
 
@@ -78,11 +73,11 @@ impl Job {
         return true;
     }
 
-    pub fn addProg(&mut self, prog: Prog) {
+    pub fn add_prog(&mut self, prog: Prog) {
         self.progs.push(prog);
     }
 
-    pub fn parseJob(mut lex: &mut InputLexer) -> Option<Job> {
+    pub fn parse_job(mut lex: &mut InputLexer) -> Option<Job> {
         let mut job: Job = Job::new();
         let mut cur_prog: Prog = Prog::new();
         let mut opt_tok: Option<InputToken>;
@@ -99,8 +94,9 @@ impl Job {
                 InputToken::Identifier(s) => {
                     if cur_prog.file == "" {
                         cur_prog.file = s;
+                        cur_prog.builtin = builtin_find_callback(&cur_prog.file);
                     } else {
-                        cur_prog.addArg(&s);
+                        cur_prog.add_arg(&s);
                     }
                 },
                 InputToken::NewLine => {
@@ -138,7 +134,7 @@ impl Job {
 
                     cur_prog.stdout = pipefd[1];
 
-                    job.addProg(cur_prog);
+                    job.add_prog(cur_prog);
                     cur_prog = Prog::new();
 
                     cur_prog.stdin = pipefd[0];
@@ -155,7 +151,7 @@ impl Job {
         }
 
         if cur_prog.file != "" {
-            job.addProg(cur_prog);
+            job.add_prog(cur_prog);
         } else {
             cur_prog.close_fds();
         }
@@ -165,6 +161,22 @@ impl Job {
         } else {
             None
         }
+    }
+
+    pub fn is_simple_bulitin(&mut self) -> bool {
+        if self.progs.len() != 1 {
+            return false;
+        }
+
+        if self.progs[0].builtin.is_none() {
+            return false;
+        }
+
+        return true;
+    }
+
+    pub fn simple_builtin_run(&mut self) -> usize {
+        self.progs[0].run_builtin()
     }
 }
 
